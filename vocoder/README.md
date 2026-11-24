@@ -106,7 +106,8 @@ L_mel  = mean over 3 scales of L1 on the log-mel, 128 bins over 0–22.05 kHz
 The discriminator gradients are cleared before every discriminator step.
 
 Not used for this checkpoint: `discriminator_channel_mult` (discriminator width), `loss_mel_extra` (log-mel terms
-`[n_fft, hop, win, n_mels, weight]` added to `L_mel`).
+`[n_fft, hop, win, n_mels, weight]` added to `L_mel`), `loss_input_mel_weight` (L1 on the input mel definition,
+added to `L_mel`).
 
 ## F0
 
