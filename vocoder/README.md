@@ -32,10 +32,16 @@ Full configuration: [`configs/small_n3_h17.json`](configs/small_n3_h17.json).
 | Batch | 36 (3 GPUs × 12), random crops of 16,384 samples aligned to the hop |
 | Optimizer | AdamW, lr 2e-4, betas (0.8, 0.99), for both generator and discriminators |
 | Schedule | lr × 0.999 per epoch (2,214 steps) |
-| Precision | 16-bit mixed; losses computed in fp32 |
+| Precision | 16-bit mixed; losses computed in fp32. See the note below. |
 | Augmentation | none |
 | F0 | `pm_ac`: Praat autocorrelation (parselmouth), 40–2000 Hz, voicing threshold 0.6. See [F0](#f0). |
 | Data | 80 h of voiced dry singing (24 h male, 56 h female), 44.1 kHz mono; singer-disjoint train / val / test. Not released. |
+
+From about step 150,000 one sub-discriminator (MPD, period 11) stopped discriminating: its output became constant
+and its feature-matching term grew from about 1 to above 50, the largest term in the generator loss for the rest of
+the run. Its activations had reached 3e4, close to the fp16 limit, and the discriminators then replaced non-finite
+values with finite ones (`nan_to_num`), so nothing showed in the logs. The current code trains in fp32 by default, has
+no `nan_to_num`, skips a step whose loss is not finite, and reports the state of every sub-discriminator while training.
 
 ## Loss
 
@@ -59,6 +65,9 @@ L_mel  = mean over 3 scales of L1 on the log-mel, 128 bins over 0–22.05 kHz
 ```
 
 The discriminator gradients are cleared before every discriminator step.
+
+Optional, not used for this checkpoint: `discriminator_channel_mult` scales the discriminator widths, and
+`loss_mel_extra` adds log-mel terms `[n_fft, hop, win, n_mels, weight]` on top of `L_mel`, each with its own band count.
 
 ## Results
 
@@ -129,8 +138,11 @@ checkpoint with `models.load_generator`.
 ```
 python prep_f0.py --manifest data.tsv --wav-root wavs --f0-root f0            # --analyzer pm_ac_stone for the refined F0
 python train.py --config configs/small_n3_h17.json --manifest data.tsv --wav-root wavs --f0-root f0 \
-    --run-name small_n3_h17 --batch 12 --devices 3
+    --run-name small_n3_h17 --batch 12 --devices 3            # --precision 16-mixed reproduces the checkpoint's setting
 ```
+
+While training, each sub-discriminator is checked every 50 steps (mean output on real and generated audio, output
+spread, largest feature, feature-matching share). `DISC-WARN` on the console means one of them has stopped working.
 
 `data.tsv` is tab-separated with the columns `path` (wav path relative to `--wav-root`, 44.1 kHz) and `split`
 (`train` / `val` / `test`).
@@ -138,7 +150,7 @@ python train.py --config configs/small_n3_h17.json --manifest data.tsv --wav-roo
 | File | |
 |---|---|
 | `models.py` | generator, discriminators, GAN losses |
-| `train.py` | training loop, auxiliary losses, checkpointing |
+| `train.py` | training loop, auxiliary losses, discriminator checks, checkpointing |
 | `data.py` | mel framing, datasets |
 | `f0.py`, `prep_f0.py` | F0 analyzers and extraction |
 | `f0_bench.py` | F0 analyzers scored on synthetic signals with known F0 |
