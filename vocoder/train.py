@@ -3,11 +3,14 @@
 
 Losses
   discriminators: LSGAN, summed over the sub-discriminators of MPD and MSD
-  generator     : adv + feature matching (MPD + MSD) + loss_aux_weight * (0.5 * L_stft + L_mel + L_mel_extra)
+  generator     : adv + feature matching (MPD + MSD)
+                  + loss_aux_weight * (0.5 * L_stft + L_mel + L_mel_extra + loss_input_mel_weight * L_mel_in)
     L_stft      : mean over loss_stft_resolutions of L1 on the complex STFT
     L_mel       : mean over loss_mel_resolutions of L1 on the full-band log-mel (num_mels bands)
     L_mel_extra : sum of weight * L1 log-mel for each [n_fft, hop, win, n_mels, weight] in loss_mel_extra (optional);
                   added on top of L_mel so an extra scale has its own band count and does not dilute the mean
+    L_mel_in    : L1 between the mel the generator was given and the same mel of its output (the input definition:
+                  DiffSinger framing, fmin..fmax, hop_size); used when loss_input_mel_weight > 0
 Discriminator width follows discriminator_channel_mult (1.0 = HiFi-GAN sizes).
 A step = one discriminator update + one generator update. A step whose loss is not finite is skipped and counted.
 
@@ -153,6 +156,11 @@ class GAN(pl.LightningModule):
         optim_g.zero_grad(set_to_none=True)
         loss_stft, loss_mel, loss_mel_x = self.aux_losses(y.squeeze(1), y_hat.float().squeeze(1))
         loss_aux = 0.5 * loss_stft + loss_mel + loss_mel_x
+        w_in = float(self.h.get('loss_input_mel_weight', 0.0))
+        loss_mel_in = y.new_zeros(())
+        if w_in > 0:
+            loss_mel_in = F.l1_loss(self.mel(y_hat.float().squeeze(1))[..., :mel.shape[-1]], mel)
+            loss_aux = loss_aux + w_in * loss_mel_in
         y_df_r, y_df_g, fm_f_r, fm_f_g = self.mpd(y, y_hat)
         y_ds_r, y_ds_g, fm_s_r, fm_s_g = self.msd(y, y_hat)
         loss_fm_f, loss_fm_s = feature_loss(fm_f_r, fm_f_g), feature_loss(fm_s_r, fm_s_g)
@@ -172,7 +180,8 @@ class GAN(pl.LightningModule):
             vals = {'train/loss_d': loss_d, 'train/loss_d_mpd': loss_d_f, 'train/loss_d_msd': loss_d_s,
                     'train/loss_g': loss_g, 'train/adv_mpd': loss_gen_f, 'train/adv_msd': loss_gen_s,
                     'train/fm_mpd': loss_fm_f, 'train/fm_msd': loss_fm_s,
-                    'train/stft': loss_stft, 'train/mel': loss_mel, 'train/mel_x': loss_mel_x}
+                    'train/stft': loss_stft, 'train/mel': loss_mel, 'train/mel_x': loss_mel_x,
+                    'train/mel_in': loss_mel_in}
             vals = {k: float(v.detach()) for k, v in vals.items()}
             vals['train/lr'] = optim_g.param_groups[0]['lr']
             vals['train/nonfinite_logged'] = self.nonfinite
