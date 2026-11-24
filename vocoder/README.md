@@ -1,6 +1,6 @@
 # zen-vocoder-small
 
-NSF-HiFiGAN singing-voice vocoder, trained from scratch. Checkpoint: step 400,000.
+NSF-HiFiGAN singing-voice vocoder, trained from scratch. Checkpoint: step 150,000.
 
 | | |
 |---|---|
@@ -8,9 +8,54 @@ NSF-HiFiGAN singing-voice vocoder, trained from scratch. Checkpoint: step 400,00
 | Output | 44.1 kHz mono waveform |
 | Mel | n_fft 2048, win 2048, hop 512, 40–16000 Hz, slaney, magnitude, `ln(clamp(x, 1e-5))`, DiffSinger framing (`center=False`, reflect pad `(n_fft-hop)/2`) |
 | F0 | one value per frame, held over the hop with continuous phase; unvoiced frames interpolated |
-| Generator | 4.92 M parameters, 18.9 MB (fp32) |
+| Generator | 4.92 M parameters (4.91 M after weight-norm removal), 18.9 MB (fp32) |
 | Compute | 18.3 GMACs per second of audio |
 | Speed | 4× real time on 8 CPU threads, 230× on one RTX 3080 (fp32, PyTorch, 10 s input) |
+
+## Comparison
+
+Copy synthesis on 300 held-out clips. Lower is better.
+
+| | stable-v1 | pc-nsf-hifigan 2025.02 | zen-vocoder-small 150k |
+|---|---|---|---|
+| mel L1 | 0.313 | 0.258 | 0.334 |
+| HF L1 | 1.121 | 1.149 | 1.002 |
+| MR-STFT | 0.805 | 0.785 | 0.782 |
+| F0 RMSE (cent) | 17.3 | 19.0 | 15.5 |
+| F0 gross error (%) | 1.45 | 2.23 | 1.42 |
+| Clips with F0 RMSE > 100 cent | 7 | 6 | 2 |
+| V/UV error (%) | 2.3 | 1.2 | 1.5 |
+
+| Model | Checkpoint | Generator parameters | Compute per second of audio | Hop |
+|---|---|---|---|---|
+| stable-v1 | fish-diffusion `nsf_hifigan-stable-v1` | 14.20 M | 28.1 GMACs | 512 |
+| pc-nsf-hifigan 2025.02 | openvpi `pc_nsf_hifigan_44.1k_hop512_128bin_2025.02` | 14.13 M | 27.9 GMACs | 512 |
+| zen-vocoder-small 150k | this repository, release `vocoder-small-150k` | 4.91 M | 18.3 GMACs | 512 |
+
+### How the numbers are computed
+
+Test set: the first 300 clips of the test split (176 female, 124 male; singers not in the training set), 44.1 kHz mono.
+
+For each clip and each model:
+
+1. `x` = the recording, cut to a multiple of 512 samples; `T = len(x) / 512` frames.
+2. `mel` = the mel of `x` as defined in the table at the top (`T` frames).
+3. `f0` = `pm_ac` F0 of `x` at hop 512 (frame centres `512·t + 256`), unvoiced frames filled by linear interpolation.
+4. `y = G(mel, f0)`, cut or zero-padded to `len(x)`. Each checkpoint is loaded with its own configuration; parameters are counted after weight-norm removal.
+5. The metrics below are computed on `(x, y)`. A table entry is the mean over the 300 clips, except the clip count.
+
+| Metric | Definition |
+|---|---|
+| mel L1 | `mean |M(x) − M(y)|` over all bins and frames. `M` = the input mel: 128 bins, 40–16000 Hz, n_fft 2048, hop 512, `ln(clamp(·, 1e-5))`. |
+| HF L1 | `S(·) = ln(clamp(|STFT(·)|, 1e-5))`, n_fft 2048, hop 512, Hann window 2048, centred. `mean |S(x) − S(y)|` over the bins at or above 16 kHz and all frames. |
+| MR-STFT | For n in 512, 1024, 2048: `S_n` as above with n_fft n, hop n/4, Hann window n; `mean |S_n(x) − S_n(y)|` over all bins and frames. The three values are averaged. |
+| F0 RMSE (cent) | `f_x`, `f_y` = `pm_ac` F0 of `x` and of `y` at hop 512, 0 = unvoiced, no interpolation. On the frames voiced in both: `c = 1200·|log2(f_y / f_x)|`; clip value `sqrt(mean(c²))`. No outliers are removed. |
+| F0 gross error (%) | Share of the frames voiced in both with `c > 50`. |
+| Clips with F0 RMSE > 100 cent | Number of clips, out of 300, whose F0 RMSE exceeds 100 cent. |
+| V/UV error (%) | Share of all frames where exactly one of `f_x`, `f_y` is voiced. |
+
+`pm_ac`: Praat autocorrelation (parselmouth `to_pitch_ac`), time step 512 / 44100 s, 40–2000 Hz, voicing threshold 0.6.
+The generators add random noise to the harmonic source, so repeated runs differ in the third decimal.
 
 ## Model size
 
@@ -28,20 +73,14 @@ Full configuration: [`configs/small_n3_h17.json`](configs/small_n3_h17.json).
 
 | | |
 |---|---|
-| Steps | 400,000 (one step = one discriminator update + one generator update) |
+| Steps | 150,000 (one step = one discriminator update + one generator update) |
 | Batch | 36 (3 GPUs × 12), random crops of 16,384 samples aligned to the hop |
 | Optimizer | AdamW, lr 2e-4, betas (0.8, 0.99), for both generator and discriminators |
 | Schedule | lr × 0.999 per epoch (2,214 steps) |
-| Precision | 16-bit mixed; losses computed in fp32. See the note below. |
+| Precision | 16-bit mixed; losses computed in fp32 |
 | Augmentation | none |
-| F0 | `pm_ac`: Praat autocorrelation (parselmouth), 40–2000 Hz, voicing threshold 0.6. See [F0](#f0). |
+| F0 | `pm_ac`, resampled to frame centres with plain linear interpolation (voiced values averaged with 0 at the edges of voiced segments) |
 | Data | 80 h of voiced dry singing (24 h male, 56 h female), 44.1 kHz mono; singer-disjoint train / val / test. Not released. |
-
-From about step 150,000 one sub-discriminator (MPD, period 11) stopped discriminating: its output became constant
-and its feature-matching term grew from about 1 to above 50, the largest term in the generator loss for the rest of
-the run. Its activations had reached 3e4, close to the fp16 limit, and the discriminators then replaced non-finite
-values with finite ones (`nan_to_num`), so nothing showed in the logs. The current code trains in fp32 by default, has
-no `nan_to_num`, skips a step whose loss is not finite, and reports the state of every sub-discriminator while training.
 
 ## Loss
 
@@ -66,35 +105,16 @@ L_mel  = mean over 3 scales of L1 on the log-mel, 128 bins over 0–22.05 kHz
 
 The discriminator gradients are cleared before every discriminator step.
 
-Optional, not used for this checkpoint: `discriminator_channel_mult` scales the discriminator widths, and
-`loss_mel_extra` adds log-mel terms `[n_fft, hop, win, n_mels, weight]` on top of `L_mel`, each with its own band count.
-
-## Results
-
-Copy synthesis on 300 held-out clips from singers not seen in training. Mel and F0 are extracted from the recording and
-fed back to the model. Lower is better.
-
-| | n | mel L1 | HF L1 | MR-STFT | F0 RMSE (cent) | F0 gross (%) | V/UV error |
-|---|---|---|---|---|---|---|---|
-| All | 300 | 0.384 | 1.030 | 0.805 | 21.2 | 2.26 | 0.015 |
-| Female | 176 | 0.383 | 1.086 | 0.824 | 21.5 | 1.65 | 0.016 |
-| Male | 124 | 0.385 | 0.950 | 0.778 | 20.9 | 3.12 | 0.015 |
-| Median F0 C3–C4 | 160 | 0.380 | 0.968 | 0.783 | 23.6 | 2.83 | 0.019 |
-| Median F0 C4–C5 | 126 | 0.384 | 1.104 | 0.827 | 18.5 | 1.53 | 0.011 |
-| Median F0 C5–C6 | 12 | 0.439 | 1.108 | 0.876 | 18.4 | 2.06 | 0.013 |
-
-- mel L1: L1 between input and output log-mel (the 128 input bins).
-- HF L1: L1 on the log-magnitude spectrum from 16 to 22.05 kHz, the band the model generates without input.
-- MR-STFT: L1 on the log-magnitude STFT, mean of n_fft 512 / 1024 / 2048.
-- F0 RMSE and gross (> 50 cent): on frames voiced in both recording and output. V/UV error: share of frames whose voicing differs.
+Not used for this checkpoint: `discriminator_channel_mult` (discriminator width), `loss_mel_extra` (log-mel terms
+`[n_fft, hop, win, n_mels, weight]` added to `L_mel`).
 
 ## F0
 
 `f0.py` has two analyzers.
 
-- `pm_ac`: Praat autocorrelation. The analysis window is 75 ms whatever the hop, so fast pitch movement is smeared.
-- `pm_ac_stone`: the same voicing and octave decisions, then each voiced frame is refined with WORLD StoneMask. A frame
-  that moves more than 300 cent from the coarse value keeps the coarse value.
+- `pm_ac`: Praat autocorrelation, 40–2000 Hz, voicing threshold 0.6; analysis window 75 ms at any hop.
+- `pm_ac_stone`: voicing and octave decisions of `pm_ac`; each voiced frame refined with WORLD StoneMask; a frame
+  that moves more than 300 cent from the `pm_ac` value keeps the `pm_ac` value.
 
 Synthetic singing-like signals with exactly known F0 (`python f0_bench.py --hop 512`, 56 clips, 98–1100 Hz).
 Cells: RMSE in cent / share of frames off by more than 50 cent.
@@ -107,21 +127,9 @@ Cells: RMSE in cent / share of frames off by more than 50 cent.
 | 50–100 | 33.1 / 10.0 % | 8.9 / 0.5 % |
 | > 100 | 60.6 / 32.5 % | 11.9 / 0.8 % |
 
-The step-400k checkpoint was trained with `pm_ac`, and with an earlier resampling step that averaged voiced values
-with 0 at the edges of voiced segments. That pulled the F0 down on 1.7 % of voiced frames and on the unvoiced frames
-interpolated from them. `f0.py` no longer does this. The results above were measured with the F0 the checkpoint was
-trained with.
-
-## Limitations
-
-- Fast pitch runs can sound buzzy. The checkpoint was trained with `pm_ac` F0, applied in 11.6 ms steps.
-- F0 accuracy is lowest on low male voices (26 cent RMSE, 4.2 % gross on the lowest register group).
-- Content above 16 kHz is generated, not reconstructed.
-- Trained on clean dry vocals only. Noisy, reverberant or mixed input is out of scope.
-
 ## Use
 
-Weights: [`zen-vocoder-small-400k.zip`](https://github.com/weiyangzen/zenmusic/releases/download/vocoder-small-400k/zen-vocoder-small-400k.zip)
+Weights: [`zen-vocoder-small-150k.zip`](https://github.com/weiyangzen/zenmusic/releases/download/vocoder-small-150k/zen-vocoder-small-150k.zip)
 (`model.ckpt` + `config.json`).
 
 ```
@@ -138,11 +146,11 @@ checkpoint with `models.load_generator`.
 ```
 python prep_f0.py --manifest data.tsv --wav-root wavs --f0-root f0            # --analyzer pm_ac_stone for the refined F0
 python train.py --config configs/small_n3_h17.json --manifest data.tsv --wav-root wavs --f0-root f0 \
-    --run-name small_n3_h17 --batch 12 --devices 3            # --precision 16-mixed reproduces the checkpoint's setting
+    --run-name small_n3_h17 --batch 12 --devices 3 --precision 16-mixed
 ```
 
-While training, each sub-discriminator is checked every 50 steps (mean output on real and generated audio, output
-spread, largest feature, feature-matching share). `DISC-WARN` on the console means one of them has stopped working.
+Every 50 steps each sub-discriminator is checked (mean output on real and generated audio, output spread, largest
+feature, feature-matching share); `DISC-WARN` is printed when one fails the check. Default precision is `32-true`.
 
 `data.tsv` is tab-separated with the columns `path` (wav path relative to `--wav-root`, 44.1 kHz) and `split`
 (`train` / `val` / `test`).
