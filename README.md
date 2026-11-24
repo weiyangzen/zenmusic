@@ -16,20 +16,20 @@ Open singing-voice models.
 
 #### Comparison with stable-v1 and pc-nsf-hifigan 2025.02
 
-Copy synthesis on 300 held-out clips. Lower is better unless the row says otherwise; the best value of each row is in bold.
+Copy synthesis on 300 held-out clips. Lower is better unless the row says otherwise; 👑 marks the best value of each row.
 
 | | stable-v1 | pc-nsf-hifigan 2025.02 | zen-vocoder-small 150k |
 |---|---|---|---|
-| mel L1 | 0.313 | **0.258** | 0.334 |
-| HF L1 | 1.121 | 1.149 | **1.002** |
-| MR-STFT | 0.805 | 0.785 | **0.782** |
-| F0 RMSE (cent) | 17.3 | 19.0 | **15.5** |
-| F0 gross error (%) | 1.45 | 2.23 | **1.42** |
-| Clips with F0 RMSE > 100 cent | 7 | 6 | **2** |
-| V/UV error (%) | 2.3 | **1.2** | 1.5 |
-| Level in quiet frames (dBFS) | −64.9 | −66.0 | **−68.0** |
-| HNR deviation (dB) | 1.91 | **1.50** | 1.68 |
-| HNR bias (dB, closest to 0 is best) | −0.36 | +0.48 | **+0.17** |
+| mel L1 | 0.313 | 👑 **0.258** | 0.334 |
+| HF L1 | 1.121 | 1.149 | 👑 **1.002** |
+| MR-STFT | 0.805 | 0.785 | 👑 **0.782** |
+| F0 RMSE (cent) | 17.3 | 19.0 | 👑 **15.5** |
+| F0 gross error (%) | 1.45 | 2.23 | 👑 **1.42** |
+| Clips with F0 RMSE > 100 cent | 7 | 6 | 👑 **2** |
+| V/UV error (%) | 2.3 | 👑 **1.2** | 1.5 |
+| Level in quiet frames (dBFS) | −64.9 | −66.0 | 👑 **−68.0** |
+| HNR deviation (dB) | 1.91 | 👑 **1.50** | 1.68 |
+| HNR bias (dB, closest to 0 is best) | −0.36 | +0.48 | 👑 **+0.17** |
 
 | Model | Checkpoint | Generator parameters | Compute per second of audio | Hop |
 |---|---|---|---|---|
