@@ -12,6 +12,8 @@ Losses
     L_mel_in    : L1 between the mel the generator was given and the same mel of its output (the input definition:
                   DiffSinger framing, fmin..fmax, hop_size); used when loss_input_mel_weight > 0
 Discriminator width follows discriminator_channel_mult (1.0 = HiFi-GAN sizes).
+Restoration training (config key "degrade", see degrade.py): with probability degrade.prob the input mel of an item is
+computed from a degraded copy of the clip (noise, hum, clipping, low-pass, clicks); targets and losses stay clean.
 A step = one discriminator update + one generator update. A step whose loss is not finite is skipped and counted.
 
 Every --log-every steps each sub-discriminator is checked: mean output on real and generated audio, output spread,
@@ -20,7 +22,7 @@ or whose features run away, is reported on the console as DISC-WARN (TensorBoard
 
 Usage:
   train.py --config configs/small_n3_h17.json --manifest M.tsv --wav-root DIR --f0-root DIR --run-name NAME
-           --batch 12 --devices 3 [--precision 32-true] [--resume auto|PATH] [--max-steps N] [--probe-steps N]
+           --batch 12 --devices 3 [--precision 32-true] [--tf32] [--resume auto|PATH] [--max-steps N] [--probe-steps N]
 Checkpoints: <runs-dir>/<run-name>/ckpt/step_XXXXXXX.ckpt every --ckpt-every steps (newest 3 kept), each one exported
 to <runs-dir>/<run-name>/export/step_XXXXXXX/{model.ckpt, config.json}.
 """
@@ -44,9 +46,8 @@ from models import (AttrDict, Generator, MultiPeriodDiscriminator, MultiScaleDis
                     feature_loss, generator_loss)
 from data import DSMel, CropSet, FullSet, read_rows, val_subset
 from export import export_generator
+from degrade import Degrader
 
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
 
 
 def loss_mel_transform(sr, n_fft, hop, win, n_mels):
@@ -76,6 +77,8 @@ class GAN(pl.LightningModule):
         self.log_every = 50
         self.disc_names = ['mpd%d' % p for p in self.h.discriminator_periods] + ['msd%d' % i for i in range(3)]
         self.disc_warn = ''
+        dg = self.h.get('degrade')
+        self.degrader = Degrader(dg, self.h.sampling_rate) if dg and float(dg.get('prob', 0)) > 0 else None
 
     def configure_optimizers(self):
         h = self.h
@@ -137,7 +140,8 @@ class GAN(pl.LightningModule):
         optim_g, optim_d = self.optimizers()
         y, f0 = batch['audio'].float(), batch['f0'].float()
         with torch.no_grad():
-            mel = self.mel(y.squeeze(1))
+            mel_clean = self.mel(y.squeeze(1))
+            mel = mel_clean if self.degrader is None else self.mel(self.degrader(y.squeeze(1)))
         y_hat = self.generator(mel, f0)
 
         # discriminators
@@ -159,7 +163,7 @@ class GAN(pl.LightningModule):
         w_in = float(self.h.get('loss_input_mel_weight', 0.0))
         loss_mel_in = y.new_zeros(())
         if w_in > 0:
-            loss_mel_in = F.l1_loss(self.mel(y_hat.float().squeeze(1))[..., :mel.shape[-1]], mel)
+            loss_mel_in = F.l1_loss(self.mel(y_hat.float().squeeze(1))[..., :mel_clean.shape[-1]], mel_clean)
             loss_aux = loss_aux + w_in * loss_mel_in
         y_df_r, y_df_g, fm_f_r, fm_f_g = self.mpd(y, y_hat)
         y_ds_r, y_ds_g, fm_s_r, fm_s_g = self.msd(y, y_hat)
@@ -288,6 +292,7 @@ def main():
     ap.add_argument('--batch', type=int, required=True, help='per GPU')
     ap.add_argument('--devices', type=int, default=1)
     ap.add_argument('--precision', default='32-true', help='32-true | 16-mixed')
+    ap.add_argument('--tf32', action='store_true', help='let convolutions / matmul use TF32 (faster, 10-bit mantissa)')
     ap.add_argument('--workers', type=int, default=6)
     ap.add_argument('--resume', default=None, help='auto | path')
     ap.add_argument('--max-steps', type=int, default=0)
@@ -300,6 +305,8 @@ def main():
     ap.add_argument('--log-every', type=int, default=50)
     a = ap.parse_args()
 
+    torch.backends.cuda.matmul.allow_tf32 = a.tf32
+    torch.backends.cudnn.allow_tf32 = a.tf32
     h = json.load(open(a.config))
     run_dir = os.path.join(a.runs_dir, a.run_name)
     os.makedirs(os.path.join(run_dir, 'ckpt'), exist_ok=True)
