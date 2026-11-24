@@ -42,7 +42,7 @@ DiffSinger framing). How much weight each model's training puts on that quantity
 
 | Model | Reconstruction loss used in training |
 |---|---|
-| pc-nsf-hifigan 2025.02 | openvpi SingingVocoders, `modules/loss/HiFiloss.py` with `configs/ft_hifigan.yaml`: 45 × L1 on the mel with this framing (n_fft 2048, hop 512, 128 bins); the STFT loss is switched off (`use_stftloss: false`). The training objective is the mel L1 row. |
+| pc-nsf-hifigan 2025.02 | openvpi SingingVocoders, `modules/loss/HiFiloss.py` with `configs/ft_hifigan.yaml`: 45 × L1 on the mel with this framing (n_fft 2048, hop 512, 128 bins); the STFT loss is switched off (`use_stftloss: false`). |
 | stable-v1 | fish-diffusion recipe: 45 × (0.5 × complex-STFT L1 at three resolutions + log-mel L1 at three scales). |
 | zen-vocoder-small 150k | 45 × (0.5 × complex-STFT L1 at three resolutions + log-mel L1 at three scales over 0–22.05 kHz), see [Loss](#loss). None of the three mel scales uses the framing of the mel L1 row. |
 
