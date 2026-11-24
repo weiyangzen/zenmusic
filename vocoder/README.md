@@ -14,7 +14,7 @@ NSF-HiFiGAN singing-voice vocoder, trained from scratch. Checkpoint: step 150,00
 
 ## Comparison
 
-Copy synthesis on 300 held-out clips. Lower is better in every row; the best value of each row is in bold.
+Copy synthesis on 300 held-out clips. Lower is better unless the row says otherwise; the best value of each row is in bold.
 
 | | stable-v1 | pc-nsf-hifigan 2025.02 | zen-vocoder-small 150k |
 |---|---|---|---|
@@ -25,6 +25,9 @@ Copy synthesis on 300 held-out clips. Lower is better in every row; the best val
 | F0 gross error (%) | 1.45 | 2.23 | **1.42** |
 | Clips with F0 RMSE > 100 cent | 7 | 6 | **2** |
 | V/UV error (%) | 2.3 | **1.2** | 1.5 |
+| Level in quiet frames (dBFS) | −64.9 | −66.0 | **−68.0** |
+| HNR deviation (dB) | 1.91 | **1.50** | 1.68 |
+| HNR bias (dB, closest to 0 is best) | −0.36 | +0.48 | **+0.17** |
 
 | Model | Checkpoint | Generator parameters | Compute per second of audio | Hop |
 |---|---|---|---|---|
@@ -67,6 +70,9 @@ For each clip and each model:
 | F0 gross error (%) | Share of the frames voiced in both with `c > 50`. |
 | Clips with F0 RMSE > 100 cent | Number of clips, out of 300, whose F0 RMSE exceeds 100 cent. |
 | V/UV error (%) | Share of all frames where exactly one of `f_x`, `f_y` is voiced. |
+| Level in quiet frames (dBFS) | Frames are consecutive blocks of 512 samples. A frame is quiet when the RMS of `x` in it is below −55 dBFS. Clip value: mean over the quiet frames of `20·log10(RMS of y in the frame)`. Mean over the 256 clips that have at least 3 quiet frames (8,711 frames). The recordings themselves are at −66.2 dBFS in these frames. Lower means the output is quieter where the recording is quiet. |
+| HNR deviation (dB) | HNR = harmonics-to-noise ratio per frame, Praat harmonicity (cross-correlation), time step 10 ms, minimum pitch 75 Hz, computed on `x` and on `y`. Over the frames with `HNR(x) > 0 dB` in which `y` is voiced: `mean |HNR(y) − HNR(x)|`. |
+| HNR bias (dB) | Same frames: `mean (HNR(y) − HNR(x))`. Positive: the output is more periodic than the recording; negative: noisier. |
 
 `pm_ac`: Praat autocorrelation (parselmouth `to_pitch_ac`), time step 512 / 44100 s, 40–2000 Hz, voicing threshold 0.6.
 The generators add random noise to the harmonic source, so repeated runs differ in the third decimal.
