@@ -37,20 +37,6 @@ Copy synthesis on 300 held-out clips. Lower is better unless the row says otherw
 | pc-nsf-hifigan 2025.02 | openvpi `pc_nsf_hifigan_44.1k_hop512_128bin_2025.02` | 14.13 M | 27.9 GMACs | 512 |
 | zen-vocoder-small 150k | this repository, release `vocoder-small-150k` | 4.91 M | 18.3 GMACs | 512 |
 
-#### Reconstruction loss of each model
-
-The mel L1 row measures one specific quantity: the L1 on the 128-bin input mel (40–16000 Hz, n_fft 2048, hop 512,
-DiffSinger framing). How much weight each model's training puts on that quantity differs:
-
-| Model | Reconstruction loss used in training |
-|---|---|
-| pc-nsf-hifigan 2025.02 | openvpi SingingVocoders, `modules/loss/HiFiloss.py` with `configs/ft_hifigan.yaml`: 45 × L1 on the mel with this framing (n_fft 2048, hop 512, 128 bins); the STFT loss is switched off (`use_stftloss: false`). |
-| stable-v1 | fish-diffusion recipe: 45 × (0.5 × complex-STFT L1 at three resolutions + log-mel L1 at three scales). |
-| zen-vocoder-small 150k | 45 × (0.5 × complex-STFT L1 at three resolutions + log-mel L1 at three scales over 0–22.05 kHz), see [Loss](vocoder/README.md#loss). None of the three mel scales uses the framing of the mel L1 row. |
-
-The weighting between the mel term and the other terms will be revised in later checkpoints, with listening quality
-as the target.
-
 #### How the numbers are computed
 
 Test set: the first 300 clips of the test split (176 female, 124 male; singers not in the training set), 44.1 kHz mono.
