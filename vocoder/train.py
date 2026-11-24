@@ -15,6 +15,8 @@ Discriminator width follows discriminator_channel_mult (1.0 = HiFi-GAN sizes).
 Restoration training (config key "degrade", see degrade.py): with probability degrade.prob the input mel of an item is
 computed from a degraded copy of the clip (noise, hum, clipping, low-pass, clicks); targets and losses stay clean.
 A step = one discriminator update + one generator update. A step whose loss is not finite is skipped and counted.
+Optional config keys: grad_clip_norm (clip the gradient norm of each update), lr_warmup_steps (linear warm-up; the
+per-epoch decay lr * lr_decay^epoch stays the same).
 
 Every --log-every steps each sub-discriminator is checked: mean output on real and generated audio, output spread,
 largest feature magnitude, its share of the feature-matching loss. A sub-discriminator whose output no longer moves,
@@ -77,6 +79,8 @@ class GAN(pl.LightningModule):
         self.log_every = 50
         self.disc_names = ['mpd%d' % p for p in self.h.discriminator_periods] + ['msd%d' % i for i in range(3)]
         self.disc_warn = ''
+        self.clip = float(self.h.get('grad_clip_norm', 0) or 0)
+        self.warmup = int(self.h.get('lr_warmup_steps', 0) or 0)
         dg = self.h.get('degrade')
         self.degrader = Degrader(dg, self.h.sampling_rate) if dg and float(dg.get('prob', 0)) > 0 else None
 
@@ -138,6 +142,11 @@ class GAN(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         optim_g, optim_d = self.optimizers()
+        if self.warmup > 0:
+            lr = self.h.learning_rate * self.h.lr_decay ** self.current_epoch * min(1.0, (self.step + 1) / self.warmup)
+            for o in (optim_g, optim_d):
+                for group in o.param_groups:
+                    group['lr'] = lr
         y, f0 = batch['audio'].float(), batch['f0'].float()
         with torch.no_grad():
             mel_clean = self.mel(y.squeeze(1))
@@ -154,6 +163,8 @@ class GAN(pl.LightningModule):
         ok_d = bool(torch.isfinite(loss_d))
         if ok_d:
             self.manual_backward(loss_d)
+            if self.clip > 0:
+                self.clip_gradients(optim_d, gradient_clip_val=self.clip, gradient_clip_algorithm='norm')
             optim_d.step()
 
         # generator
@@ -173,10 +184,12 @@ class GAN(pl.LightningModule):
         ok_g = bool(torch.isfinite(loss_g))
         if ok_g:
             self.manual_backward(loss_g)
+            if self.clip > 0:
+                self.clip_gradients(optim_g, gradient_clip_val=self.clip, gradient_clip_algorithm='norm')
             optim_g.step()
         self.nonfinite += int(not (ok_d and ok_g))
 
-        if self.trainer.is_last_batch:
+        if self.trainer.is_last_batch and self.warmup == 0:
             for s in self.lr_schedulers():
                 s.step()
 
