@@ -1,0 +1,14 @@
+# weights are distributed via releases, not git
+release_assets/
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.zip
+*.wav
+*.flac
+*.npy
+runs/
+__pycache__/
+*.pyc
+.DS_Store

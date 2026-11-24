@@ -1,0 +1,8 @@
+torch>=2.1
+torchaudio
+pytorch-lightning>=2.1
+tensorboard
+numpy
+librosa
+soundfile
+praat-parselmouth
