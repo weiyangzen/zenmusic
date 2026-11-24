@@ -34,7 +34,7 @@ Full configuration: [`configs/small_n3_h17.json`](configs/small_n3_h17.json).
 | Schedule | lr × 0.999 per epoch (2,214 steps) |
 | Precision | 16-bit mixed; losses computed in fp32 |
 | Augmentation | none |
-| F0 | Praat autocorrelation (parselmouth), 40–2000 Hz, voicing threshold 0.6 |
+| F0 | `pm_ac`: Praat autocorrelation (parselmouth), 40–2000 Hz, voicing threshold 0.6. See [F0](#f0). |
 | Data | 80 h of voiced dry singing (24 h male, 56 h female), 44.1 kHz mono; singer-disjoint train / val / test. Not released. |
 
 ## Loss
@@ -79,9 +79,33 @@ fed back to the model. Lower is better.
 - MR-STFT: L1 on the log-magnitude STFT, mean of n_fft 512 / 1024 / 2048.
 - F0 RMSE and gross (> 50 cent): on frames voiced in both recording and output. V/UV error: share of frames whose voicing differs.
 
+## F0
+
+`f0.py` has two analyzers.
+
+- `pm_ac`: Praat autocorrelation. The analysis window is 75 ms whatever the hop, so fast pitch movement is smeared.
+- `pm_ac_stone`: the same voicing and octave decisions, then each voiced frame is refined with WORLD StoneMask. A frame
+  that moves more than 300 cent from the coarse value keeps the coarse value.
+
+Synthetic singing-like signals with exactly known F0 (`python f0_bench.py --hop 512`, 56 clips, 98–1100 Hz).
+Cells: RMSE in cent / share of frames off by more than 50 cent.
+
+| True pitch speed | `pm_ac` | `pm_ac_stone` |
+|---|---|---|
+| All frames | 20.4 / 3.3 % | 9.8 / 0.6 % |
+| < 15 semitones/s | 11.4 / 0.8 % | 9.8 / 0.7 % |
+| 15–50 | 17.6 / 1.9 % | 9.5 / 0.4 % |
+| 50–100 | 33.1 / 10.0 % | 8.9 / 0.5 % |
+| > 100 | 60.6 / 32.5 % | 11.9 / 0.8 % |
+
+The step-400k checkpoint was trained with `pm_ac`, and with an earlier resampling step that averaged voiced values
+with 0 at the edges of voiced segments. That pulled the F0 down on 1.7 % of voiced frames and on the unvoiced frames
+interpolated from them. `f0.py` no longer does this. The results above were measured with the F0 the checkpoint was
+trained with.
+
 ## Limitations
 
-- Fast pitch runs can sound buzzy. F0 is tracked with a 75 ms window and applied in 11.6 ms steps.
+- Fast pitch runs can sound buzzy. The checkpoint was trained with `pm_ac` F0, applied in 11.6 ms steps.
 - F0 accuracy is lowest on low male voices (26 cent RMSE, 4.2 % gross on the lowest register group).
 - Content above 16 kHz is generated, not reconstructed.
 - Trained on clean dry vocals only. Noisy, reverberant or mixed input is out of scope.
@@ -103,7 +127,7 @@ checkpoint with `models.load_generator`.
 ## Train
 
 ```
-python prep_f0.py --manifest data.tsv --wav-root wavs --f0-root f0
+python prep_f0.py --manifest data.tsv --wav-root wavs --f0-root f0            # --analyzer pm_ac_stone for the refined F0
 python train.py --config configs/small_n3_h17.json --manifest data.tsv --wav-root wavs --f0-root f0 \
     --run-name small_n3_h17 --batch 12 --devices 3
 ```
@@ -116,7 +140,8 @@ python train.py --config configs/small_n3_h17.json --manifest data.tsv --wav-roo
 | `models.py` | generator, discriminators, GAN losses |
 | `train.py` | training loop, auxiliary losses, checkpointing |
 | `data.py` | mel framing, datasets |
-| `f0.py`, `prep_f0.py` | F0 extraction |
+| `f0.py`, `prep_f0.py` | F0 analyzers and extraction |
+| `f0_bench.py` | F0 analyzers scored on synthetic signals with known F0 |
 | `export.py` | training checkpoint → `model.ckpt` + `config.json` |
 | `infer.py` | copy synthesis |
 
