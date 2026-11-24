@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Extract frame-level F0 for every clip in the manifest.
 
-Usage: prep_f0.py --manifest M.tsv --wav-root DIR --f0-root DIR [--hop 512] [--procs 16]
+Usage: prep_f0.py --manifest M.tsv --wav-root DIR --f0-root DIR [--hop 512] [--analyzer pm_ac|pm_ac_stone] [--procs 16]
 """
 import os
 for _v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
@@ -10,7 +10,7 @@ import sys, csv, time, argparse
 import numpy as np
 from multiprocessing import Pool
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from f0 import extract_f0, interp_uv, SR
+from f0 import extract_f0, interp_uv, SR, ANALYZERS
 from data import f0_path
 
 A = None
@@ -24,7 +24,7 @@ def work(rel):
             return rel, 'skip'
         x, sr = sf.read(os.path.join(A.wav_root, rel), dtype='float32', always_2d=True)
         assert sr == SR, sr
-        f, _ = interp_uv(extract_f0(x.mean(1), A.hop))
+        f, _ = interp_uv(extract_f0(x.mean(1), A.hop, analyzer=A.analyzer))
         os.makedirs(os.path.dirname(out), exist_ok=True)
         np.save(out + '.tmp.npy', f.astype(np.float32))
         os.replace(out + '.tmp.npy', out)
@@ -38,6 +38,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--manifest', required=True); ap.add_argument('--wav-root', required=True)
     ap.add_argument('--f0-root', required=True); ap.add_argument('--hop', type=int, default=512)
+    ap.add_argument('--analyzer', default='pm_ac', choices=ANALYZERS)
     ap.add_argument('--procs', type=int, default=16)
     A = ap.parse_args()
     rels = [r['path'] for r in csv.DictReader(open(A.manifest, encoding='utf-8'), delimiter='\t')]
