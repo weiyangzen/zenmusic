@@ -1,12 +1,23 @@
 #!/usr/bin/env python3
 """NSF-HiFiGAN GAN training (Lightning, manual optimization, DDP).
 
-Losses: adv + feature matching (MPD + MSD) + aux_w * (0.5 * multi-res complex STFT L1 + multi-scale full-band log-mel L1).
-Step = one generator/discriminator update pair (Lightning global_step counts optimizer steps, i.e. 2 per step).
+Losses
+  discriminators: LSGAN, summed over the sub-discriminators of MPD and MSD
+  generator     : adv + feature matching (MPD + MSD) + loss_aux_weight * (0.5 * L_stft + L_mel + L_mel_extra)
+    L_stft      : mean over loss_stft_resolutions of L1 on the complex STFT
+    L_mel       : mean over loss_mel_resolutions of L1 on the full-band log-mel (num_mels bands)
+    L_mel_extra : sum of weight * L1 log-mel for each [n_fft, hop, win, n_mels, weight] in loss_mel_extra (optional);
+                  added on top of L_mel so an extra scale has its own band count and does not dilute the mean
+Discriminator width follows discriminator_channel_mult (1.0 = HiFi-GAN sizes).
+A step = one discriminator update + one generator update. A step whose loss is not finite is skipped and counted.
+
+Every --log-every steps each sub-discriminator is checked: mean output on real and generated audio, output spread,
+largest feature magnitude, its share of the feature-matching loss. A sub-discriminator whose output no longer moves,
+or whose features run away, is reported on the console as DISC-WARN (TensorBoard: disc/*).
 
 Usage:
   train.py --config configs/small_n3_h17.json --manifest M.tsv --wav-root DIR --f0-root DIR --run-name NAME
-           --batch 12 --devices 3 [--precision 16-mixed] [--resume auto|PATH] [--max-steps N]
+           --batch 12 --devices 3 [--precision 32-true] [--resume auto|PATH] [--max-steps N] [--probe-steps N]
 Checkpoints: <runs-dir>/<run-name>/ckpt/step_XXXXXXX.ckpt every --ckpt-every steps (newest 3 kept), each one exported
 to <runs-dir>/<run-name>/export/step_XXXXXXX/{model.ckpt, config.json}.
 """
@@ -47,16 +58,21 @@ class GAN(pl.LightningModule):
         self.save_hyperparameters({'h': dict(h)})
         self.h = AttrDict(h)
         self.generator = Generator(self.h)
-        self.mpd = MultiPeriodDiscriminator(self.h.discriminator_periods)
-        self.msd = MultiScaleDiscriminator()
+        d_mult = float(self.h.get('discriminator_channel_mult', 1.0))
+        self.mpd = MultiPeriodDiscriminator(self.h.discriminator_periods, d_mult)
+        self.msd = MultiScaleDiscriminator(d_mult)
         self.mel = DSMel.from_h(self.h)
         # plain lists: not registered, not in state_dict
         self._loss_mels = [loss_mel_transform(self.h.sampling_rate, n, hp, w, self.h.num_mels)
                            for n, hp, w in self.h.loss_mel_resolutions]
+        self._loss_mels_x = [(loss_mel_transform(self.h.sampling_rate, int(n), int(hp), int(w), int(nm)), float(wt))
+                             for n, hp, w, nm, wt in self.h.get('loss_mel_extra', [])]
         self._loss_mels_dev = None
         self.automatic_optimization = False
-        self.nonfinite = 0
+        self.nonfinite = 0          # steps skipped because a loss was not finite
         self.log_every = 50
+        self.disc_names = ['mpd%d' % p for p in self.h.discriminator_periods] + ['msd%d' % i for i in range(3)]
+        self.disc_warn = ''
 
     def configure_optimizers(self):
         h = self.h
@@ -72,6 +88,7 @@ class GAN(pl.LightningModule):
     def loss_mels(self, device):
         if self._loss_mels_dev is None:
             self._loss_mels_dev = [t.to(device) for t in self._loss_mels]
+            self._loss_mels_x = [(t.to(device), wt) for t, wt in self._loss_mels_x]
         return self._loss_mels_dev
 
     def aux_losses(self, y, y_hat):
@@ -89,7 +106,29 @@ class GAN(pl.LightningModule):
                 m_hat = torch.log(torch.clamp(t(y_hat), min=1e-5))
                 loss_mel = loss_mel + F.l1_loss(m_hat, m)
             loss_mel = loss_mel / len(self.h.loss_mel_resolutions)
-        return loss_stft, loss_mel
+            loss_mel_x = y.new_zeros(())
+            for t, wt in self._loss_mels_x:
+                loss_mel_x = loss_mel_x + wt * F.l1_loss(torch.log(torch.clamp(t(y_hat), min=1e-5)),
+                                                         torch.log(torch.clamp(t(y), min=1e-5)))
+        return loss_stft, loss_mel, loss_mel_x
+
+    @torch.no_grad()
+    def disc_health(self, d_real, d_fake, fm_real, fm_fake):
+        """per sub-discriminator: mean output on real / generated, output spread, largest feature, feature-matching share"""
+        vals, warn = {}, []
+        fms = [float(2 * sum(torch.mean(torch.abs(a.float() - b.float())) for a, b in zip(fr, fg)))
+               for fr, fg in zip(fm_real, fm_fake)]
+        med = float(np.median(fms)) + 1e-9
+        for name, r, g, fr, fm in zip(self.disc_names, d_real, d_fake, fm_real, fms):
+            r, g = r.float(), g.float()
+            spread = float(torch.cat([r.flatten(), g.flatten()]).std())
+            feat = max(float(a.float().abs().max()) for a in fr[:-1])
+            vals.update({'disc/%s_real' % name: float(r.mean()), 'disc/%s_fake' % name: float(g.mean()),
+                         'disc/%s_spread' % name: spread, 'disc/%s_featmax' % name: feat, 'disc/%s_fm' % name: fm})
+            if spread < 1e-3: warn.append('%s output constant (spread %.1e)' % (name, spread))
+            if feat > 1e4: warn.append('%s features %.1e' % (name, feat))
+            if fm > 10 * med and fm > 5: warn.append('%s fm %.1f vs median %.1f' % (name, fm, med))
+        return vals, '; '.join(warn)
 
     def training_step(self, batch, batch_idx):
         optim_g, optim_d = self.optimizers()
@@ -105,20 +144,25 @@ class GAN(pl.LightningModule):
         loss_d_f = discriminator_loss(y_df_r, y_df_g)
         loss_d_s = discriminator_loss(y_ds_r, y_ds_g)
         loss_d = loss_d_f + loss_d_s
-        self.manual_backward(loss_d)
-        optim_d.step()
+        ok_d = bool(torch.isfinite(loss_d))
+        if ok_d:
+            self.manual_backward(loss_d)
+            optim_d.step()
 
         # generator
         optim_g.zero_grad(set_to_none=True)
-        loss_stft, loss_mel = self.aux_losses(y.squeeze(1), y_hat.float().squeeze(1))
-        loss_aux = 0.5 * loss_stft + loss_mel
+        loss_stft, loss_mel, loss_mel_x = self.aux_losses(y.squeeze(1), y_hat.float().squeeze(1))
+        loss_aux = 0.5 * loss_stft + loss_mel + loss_mel_x
         y_df_r, y_df_g, fm_f_r, fm_f_g = self.mpd(y, y_hat)
         y_ds_r, y_ds_g, fm_s_r, fm_s_g = self.msd(y, y_hat)
         loss_fm_f, loss_fm_s = feature_loss(fm_f_r, fm_f_g), feature_loss(fm_s_r, fm_s_g)
         loss_gen_f, loss_gen_s = generator_loss(y_df_g), generator_loss(y_ds_g)
         loss_g = loss_gen_s + loss_gen_f + loss_fm_s + loss_fm_f + loss_aux * self.h.loss_aux_weight
-        self.manual_backward(loss_g)
-        optim_g.step()
+        ok_g = bool(torch.isfinite(loss_g))
+        if ok_g:
+            self.manual_backward(loss_g)
+            optim_g.step()
+        self.nonfinite += int(not (ok_d and ok_g))
 
         if self.trainer.is_last_batch:
             for s in self.lr_schedulers():
@@ -128,12 +172,12 @@ class GAN(pl.LightningModule):
             vals = {'train/loss_d': loss_d, 'train/loss_d_mpd': loss_d_f, 'train/loss_d_msd': loss_d_s,
                     'train/loss_g': loss_g, 'train/adv_mpd': loss_gen_f, 'train/adv_msd': loss_gen_s,
                     'train/fm_mpd': loss_fm_f, 'train/fm_msd': loss_fm_s,
-                    'train/stft': loss_stft, 'train/mel': loss_mel}
+                    'train/stft': loss_stft, 'train/mel': loss_mel, 'train/mel_x': loss_mel_x}
             vals = {k: float(v.detach()) for k, v in vals.items()}
-            bad = not all(np.isfinite(v) for v in vals.values())
-            self.nonfinite += int(bad)
             vals['train/lr'] = optim_g.param_groups[0]['lr']
             vals['train/nonfinite_logged'] = self.nonfinite
+            health, self.disc_warn = self.disc_health(y_df_r + y_ds_r, y_df_g + y_ds_g, fm_f_r + fm_s_r, fm_f_g + fm_s_g)
+            vals.update(health)
             scaler = getattr(self.trainer.precision_plugin, 'scaler', None)
             if scaler is not None:
                 vals['train/amp_scale'] = float(scaler.get_scale())
@@ -166,11 +210,12 @@ class GAN(pl.LightningModule):
 class StepTasks(Callback):
     """Console log, periodic checkpoint + generator export."""
 
-    def __init__(self, run_dir, ckpt_every, keep=3, print_every=100, max_steps=0):
+    def __init__(self, run_dir, ckpt_every, keep=3, print_every=100, max_steps=0, probe_steps=0):
         self.run_dir, self.ckpt_every, self.keep = run_dir, ckpt_every, keep
-        self.print_every, self.max_steps = print_every, max_steps
+        self.print_every, self.max_steps, self.probe_steps = print_every, max_steps, probe_steps
         self.last_ckpt = -1
         self.t_last, self.s_last = None, None
+        self.t_warm = None
 
     def on_train_start(self, trainer, pl_module):
         self.last_ckpt = pl_module.step
@@ -178,18 +223,35 @@ class StepTasks(Callback):
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         step = pl_module.step
+        if self.probe_steps:                      # timing / memory probe: no checkpoints, stop after probe_steps
+            if step == 50:
+                torch.cuda.synchronize(); self.t_warm = time.time()
+            if step >= self.probe_steps:
+                torch.cuda.synchronize()
+                res = {'rank': trainer.global_rank, 'steps': step, 'it_s': (step - 50) / (time.time() - self.t_warm),
+                       'max_alloc_gb': torch.cuda.max_memory_allocated() / 2 ** 30,
+                       'last': getattr(pl_module, 'last_vals', {})}
+                with open(os.path.join(self.run_dir, 'probe_rank%d.json' % trainer.global_rank), 'w') as f:
+                    json.dump(res, f, indent=1)
+                trainer.should_stop = True
+            return
         if trainer.is_global_zero and step % self.print_every == 0 and step != self.s_last:
             t = time.time()
             ips = (step - self.s_last) / max(t - self.t_last, 1e-6)
             self.t_last, self.s_last = t, step
             v = getattr(pl_module, 'last_vals', {})
-            print('[step %d] ep %d it/s %.3f | d %.3f g %.3f mel %.4f stft %.4f fm %.3f/%.3f adv %.3f/%.3f lr %.3g '
-                  'nonfinite %d' % (
-                      step, trainer.current_epoch, ips,
+            reals = [v[k] for k in v if k.startswith('disc/') and k.endswith('_real')] or [np.nan]
+            feats = [v[k] for k in v if k.startswith('disc/') and k.endswith('_featmax')] or [np.nan]
+            print('[step %d] ep %d it/s %.3f mem %.1fG | d %.3f g %.3f mel %.4f stft %.4f fm %.3f/%.3f adv %.3f/%.3f '
+                  'lr %.3g scale %s nonfinite %d | D(real) %.2f..%.2f featmax %.3g' % (
+                      step, trainer.current_epoch, ips, torch.cuda.max_memory_allocated() / 2 ** 30,
                       v.get('train/loss_d', np.nan), v.get('train/loss_g', np.nan), v.get('train/mel', np.nan),
                       v.get('train/stft', np.nan), v.get('train/fm_mpd', np.nan), v.get('train/fm_msd', np.nan),
                       v.get('train/adv_mpd', np.nan), v.get('train/adv_msd', np.nan), v.get('train/lr', np.nan),
-                      v.get('train/nonfinite_logged', 0)), flush=True)
+                      v.get('train/amp_scale', '-'), v.get('train/nonfinite_logged', 0), min(reals), max(reals),
+                      max(feats)), flush=True)
+            if pl_module.disc_warn:
+                print('[step %d] DISC-WARN %s' % (step, pl_module.disc_warn), flush=True)
         if self.ckpt_every and step % self.ckpt_every == 0 and step != self.last_ckpt:
             self.last_ckpt = step
             self.save(trainer, step)
@@ -216,10 +278,11 @@ def main():
     ap.add_argument('--run-name', required=True)
     ap.add_argument('--batch', type=int, required=True, help='per GPU')
     ap.add_argument('--devices', type=int, default=1)
-    ap.add_argument('--precision', default='16-mixed')
+    ap.add_argument('--precision', default='32-true', help='32-true | 16-mixed')
     ap.add_argument('--workers', type=int, default=6)
     ap.add_argument('--resume', default=None, help='auto | path')
     ap.add_argument('--max-steps', type=int, default=0)
+    ap.add_argument('--probe-steps', type=int, default=0, help='time N steps and stop; nothing is saved')
     ap.add_argument('--ckpt-every', type=int, default=5000)
     ap.add_argument('--val-every', type=int, default=5000)
     ap.add_argument('--val-n', type=int, default=200)
@@ -232,7 +295,7 @@ def main():
     run_dir = os.path.join(a.runs_dir, a.run_name)
     os.makedirs(os.path.join(run_dir, 'ckpt'), exist_ok=True)
     rank = int(os.environ.get('LOCAL_RANK', 0))
-    if rank == 0:
+    if rank == 0 and not a.probe_steps:
         json.dump(h, open(os.path.join(run_dir, 'config.json'), 'w'), indent=2)
         with open(os.path.join(run_dir, 'cmdline.txt'), 'a') as f:
             f.write(time.strftime('%F %T ') + ' '.join(sys.argv) + '\n')
@@ -242,20 +305,23 @@ def main():
     train_set = CropSet(read_rows(a.manifest, 'train'), a.wav_root, a.f0_root, h['segment_size'], h['hop_size'])
     train_loader = DataLoader(train_set, batch_size=a.batch, shuffle=True, num_workers=a.workers, drop_last=True,
                               pin_memory=True, persistent_workers=True, prefetch_factor=4)
-    val_loader = DataLoader(FullSet(val_subset(a.manifest, a.val_n), a.wav_root, a.f0_root, h['hop_size']),
-                            batch_size=1, shuffle=False, num_workers=2, pin_memory=True, persistent_workers=True)
+    val_loader = None
+    if not a.probe_steps:
+        val_loader = DataLoader(FullSet(val_subset(a.manifest, a.val_n), a.wav_root, a.f0_root, h['hop_size']),
+                                batch_size=1, shuffle=False, num_workers=2, pin_memory=True, persistent_workers=True)
 
     model = GAN(h)
     model.log_every = a.log_every
-    logger = TensorBoardLogger(a.runs_dir, name=a.run_name, version='tb', default_hp_metric=False)
-    cb = StepTasks(run_dir, a.ckpt_every, max_steps=a.max_steps)
+    logger = False if a.probe_steps else TensorBoardLogger(a.runs_dir, name=a.run_name, version='tb',
+                                                           default_hp_metric=False)
+    cb = StepTasks(run_dir, 0 if a.probe_steps else a.ckpt_every, max_steps=a.max_steps, probe_steps=a.probe_steps)
     trainer = pl.Trainer(
         accelerator='gpu', devices=a.devices, precision=a.precision,
         strategy=DDPStrategy(find_unused_parameters=True, process_group_backend='nccl') if a.devices > 1 else 'auto',
         max_epochs=-1, max_steps=-1, logger=logger, callbacks=[cb], enable_checkpointing=False,
         enable_progress_bar=False, enable_model_summary=(rank == 0), benchmark=True,
         val_check_interval=a.val_every, check_val_every_n_epoch=None,
-        num_sanity_val_steps=0, log_every_n_steps=50,
+        limit_val_batches=0 if a.probe_steps else None, num_sanity_val_steps=0, log_every_n_steps=50,
         default_root_dir=run_dir,
     )
     ckpt = None
